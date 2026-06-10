@@ -557,6 +557,30 @@ static bool validSubject(const string& code)
     return regex_match(code, re);
 }
 
+struct CourseCode { string subject, number; };
+
+// "cs204" -> {"CS","204"}: leading letters are the subject, the rest the course
+// number. Returns false if it isn't letters-then-something or the subject is
+// not a valid code.
+static bool parseCode(const string& raw, CourseCode& out)
+{
+    size_t b = raw.find_first_not_of(" \t\r\n");
+    size_t e = raw.find_last_not_of(" \t\r\n");
+    if (b == string::npos) return false;
+    string t = raw.substr(b, e - b + 1);
+    size_t i = 0;
+    while (i < t.size() && isalpha((unsigned char)t[i])) ++i;
+    if (i == 0 || i == t.size()) return false;
+    string subj = t.substr(0, i), num = t.substr(i);
+    transform(subj.begin(), subj.end(), subj.begin(),
+              [](unsigned char c) { return toupper(c); });
+    transform(num.begin(), num.end(), num.begin(),
+              [](unsigned char c) { return toupper(c); });
+    if (!validSubject(subj)) return false;
+    out = {subj, num};
+    return true;
+}
+
 static bool isAll(const string& s)
 {
     size_t b = s.find_first_not_of(" \t\r\n");
@@ -651,6 +675,21 @@ static string clientIp(const httplib::Request& req, bool behindProxy)
     return req.remote_addr;
 }
 
+// Returns the first query param not in the allowed list, or "" if all are
+// recognized. Lets each endpoint reject typos / misplaced params with a 400.
+static string unknownParam(const httplib::Request& req,
+                           initializer_list<const char*> allowed)
+{
+    for (const auto& kv : req.params) {
+        bool ok = false;
+        for (const char* a : allowed) {
+            if (kv.first == a) { ok = true; break; }
+        }
+        if (!ok) return kv.first;
+    }
+    return "";
+}
+
 static int runServer(const string& host, int port, bool behindProxy)
 {
     httplib::Server svr;
@@ -674,13 +713,25 @@ static int runServer(const string& host, int port, bool behindProxy)
             respond(res, 429, errorJson("rate limit exceeded"), pretty);
             return;
         }
+        if (string bad = unknownParam(req, {"term", "subjects", "codes", "pretty"});
+            !bad.empty()) {
+            respond(res, 400, errorJson("unknown query param: " + bad), pretty);
+            return;
+        }
         string term = req.get_param_value("term");
         string subjectsParam = req.get_param_value("subjects");
-        if (term.empty() || subjectsParam.empty()) {
+        string codesParam = req.get_param_value("codes");
+        if (term.empty() || (subjectsParam.empty() && codesParam.empty())) {
             respond(res, 400,
-                    errorJson("required query params: term, subjects "
-                              "(e.g. ?term=202503&subjects=CS,MATH or all)"),
+                    errorJson("required: term and one of subjects or codes "
+                              "(e.g. ?term=202503&subjects=CS,MATH or "
+                              "?term=202503&codes=CS204,MATH101)"),
                     pretty);
+            return;
+        }
+        if (!subjectsParam.empty() && !codesParam.empty()) {
+            respond(res, 400,
+                    errorJson("use either subjects or codes, not both"), pretty);
             return;
         }
         if (!validTerm(term)) {
@@ -689,9 +740,38 @@ static int runServer(const string& host, int port, bool behindProxy)
             return;
         }
 
-        bool wantAll = isAll(subjectsParam);
-        vector<string> subjects;
-        if (!wantAll) {
+        bool wantAll = false;
+        vector<string> subjects;      // subjects to fetch
+        vector<CourseCode> codes;     // exact (subject, number) filter; empty = none
+
+        if (!codesParam.empty()) {
+            for (const string& tok : parseSubjectList(codesParam)) {
+                CourseCode cc;
+                if (!parseCode(tok, cc)) {
+                    respond(res, 400,
+                            errorJson("invalid course code: " + tok +
+                                      " (expected like CS204)"), pretty);
+                    return;
+                }
+                codes.push_back(cc);
+            }
+            if (codes.empty()) {
+                respond(res, 400, errorJson("no valid course codes given"), pretty);
+                return;
+            }
+            for (const CourseCode& c : codes) {
+                if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
+                    subjects.push_back(c.subject);
+            }
+            if (subjects.size() > kMaxSubjects) {
+                respond(res, 400,
+                        errorJson("too many distinct subjects in codes (max " +
+                                  to_string(kMaxSubjects) + ")"), pretty);
+                return;
+            }
+        } else if (isAll(subjectsParam)) {
+            wantAll = true;
+        } else {
             subjects = parseSubjectList(subjectsParam);
             if (subjects.empty()) {
                 respond(res, 400,
@@ -752,8 +832,21 @@ static int runServer(const string& host, int port, bool behindProxy)
                 html = fetchScheduleHtml(enc.get(), term, subjects);
                 cache.put(key, html, ttl);
             }
-            respond(res, 200,
-                    coursesEnvelope(term, subjects, parseCourses(html)), pretty);
+
+            vector<Course> courses = parseCourses(html);
+            if (!codes.empty()) {
+                vector<Course> filtered;
+                for (const Course& c : courses) {
+                    for (const CourseCode& cc : codes) {
+                        if (c.subject == cc.subject && c.course == cc.number) {
+                            filtered.push_back(c);
+                            break;
+                        }
+                    }
+                }
+                courses = move(filtered);
+            }
+            respond(res, 200, coursesEnvelope(term, subjects, courses), pretty);
         } catch (const exception& e) {
             respond(res, 502, errorJson(e.what()), pretty);
         }
@@ -763,6 +856,10 @@ static int runServer(const string& host, int port, bool behindProxy)
         bool pretty = wantsPretty(req);
         if (!allowed(req)) {
             respond(res, 429, errorJson("rate limit exceeded"), pretty);
+            return;
+        }
+        if (string bad = unknownParam(req, {"pretty"}); !bad.empty()) {
+            respond(res, 400, errorJson("unknown query param: " + bad), pretty);
             return;
         }
         try {
@@ -785,6 +882,10 @@ static int runServer(const string& host, int port, bool behindProxy)
         bool pretty = wantsPretty(req);
         if (!allowed(req)) {
             respond(res, 429, errorJson("rate limit exceeded"), pretty);
+            return;
+        }
+        if (string bad = unknownParam(req, {"term", "pretty"}); !bad.empty()) {
+            respond(res, 400, errorJson("unknown query param: " + bad), pretty);
             return;
         }
         string term = req.get_param_value("term");
@@ -824,6 +925,11 @@ static int runServer(const string& host, int port, bool behindProxy)
             respond(res, 429, errorJson("rate limit exceeded"), pretty);
             return;
         }
+        if (string bad = unknownParam(req, {"route", "day", "time", "pretty"});
+            !bad.empty()) {
+            respond(res, 400, errorJson("unknown query param: " + bad), pretty);
+            return;
+        }
         try {
             string html;
             if (auto cached = cache.get("shuttles")) {
@@ -853,7 +959,8 @@ static int runServer(const string& host, int port, bool behindProxy)
 
     cout << "suAPI listening on http://" << host << ":" << port
          << (behindProxy ? " (trusting X-Forwarded-For)" : "") << "\n"
-         << "  GET /courses?term=202503&subjects=CS,MATH\n"
+         << "  GET /courses?term=202503&subjects=CS,MATH (or &subjects=all,"
+            " or &codes=CS204,MATH101)\n"
          << "  GET /terms\n"
          << "  GET /subjects?term=202503\n"
          << "  GET /shuttles[?route=&day=&time=]\n"
@@ -865,24 +972,59 @@ static int runServer(const string& host, int port, bool behindProxy)
     return 0;
 }
 
-static int cliCourses(const string& term, const string& subjectsCsv, bool pretty)
+static int cliCourses(const string& term, const string& arg, bool pretty)
 {
     Curl enc;
     vector<string> subjects;
-    if (isAll(subjectsCsv)) {
+    vector<CourseCode> codes;
+
+    if (isAll(arg)) {
         for (const Option& o :
              parseSelectOptions(fetchSubjectsHtml(enc.get(), term), "sel_subj")) {
             subjects.push_back(o.value);
         }
     } else {
-        subjects = parseSubjectList(subjectsCsv);
+        vector<string> toks = parseSubjectList(arg);
+        // A token containing a digit (CS204) is a course code; plain letters
+        // (CS) are a subject. Treat the whole list as codes only if every
+        // token carries a number.
+        bool asCodes = !toks.empty();
+        for (const string& t : toks) {
+            if (t.find_first_of("0123456789") == string::npos) { asCodes = false; break; }
+        }
+        if (asCodes) {
+            for (const string& t : toks) {
+                CourseCode cc;
+                if (parseCode(t, cc)) codes.push_back(cc);
+            }
+            for (const CourseCode& c : codes) {
+                if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
+                    subjects.push_back(c.subject);
+            }
+        } else {
+            subjects = toks;
+        }
     }
     if (subjects.empty()) {
-        cout << errorJson("no valid subject codes given").dump(pretty);
+        cout << errorJson("no valid subject or course codes given").dump(pretty);
         return 2;
     }
+
     string html = fetchScheduleHtml(enc.get(), term, subjects);
-    cout << coursesEnvelope(term, subjects, parseCourses(html)).dump(pretty);
+    vector<Course> courses = parseCourses(html);
+    if (!codes.empty()) {
+        vector<Course> filtered;
+        for (const Course& c : courses) {
+            for (const CourseCode& cc : codes) {
+                if (c.subject == cc.subject && c.course == cc.number) {
+                    filtered.push_back(c);
+                    break;
+                }
+            }
+        }
+        courses = move(filtered);
+    }
+    cout << coursesEnvelope(term, subjects, courses).dump(pretty);
     return 0;
 }
 
@@ -926,7 +1068,8 @@ int main(int argc, char** argv)
                 "usage:\n"
                 "  serve [port]            start HTTP API (default 8080)\n"
                 "  <term> <subjects>       course sections, e.g. 202503 CS,MATH\n"
-                "                          (subjects may be 'all' for every code)\n"
+                "                          ('all' for every subject, or specific\n"
+                "                          courses like 202503 CS204,MATH101)\n"
                 "  terms                   list available terms\n"
                 "  subjects <term>         list subjects for a term\n"
                 "  shuttles                campus shuttle schedule\n"

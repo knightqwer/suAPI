@@ -67,6 +67,9 @@ static string httpRequest(const string& url, const string& body)
     curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response);
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl.get(), CURLOPT_USERAGENT,
+                     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                     "(KHTML, like Gecko) Chrome/120.0 Safari/537.36");
 
     CURLcode res = curl_easy_perform(curl.get());
     long status = 0;
@@ -131,6 +134,12 @@ static string fetchSubjectsHtml(CURL* enc, const string& term)
     return httpRequest(string(kBase) + "bwckgens.p_proc_term_date", body);
 }
 
+static string fetchShuttlesHtml()
+{
+    return httpRequest(
+        "https://www.sabanciuniv.edu/tr/kampus-shuttle-seferleri", "");
+}
+
 struct Meeting {
     string type, time, days, where, dateRange, scheduleType, instructors;
 };
@@ -142,6 +151,10 @@ struct Course {
 
 struct Option {
     string value, label;
+};
+
+struct Departure {
+    string route, day, from, to, time;
 };
 
 static string htmlToText(const string& html)
@@ -294,6 +307,85 @@ static vector<Course> parseCourses(const string& html)
     return courses;
 }
 
+static vector<string> splitOn(const string& s, const string& delim)
+{
+    vector<string> out;
+    size_t pos = 0, hit;
+    while ((hit = s.find(delim, pos)) != string::npos) {
+        out.push_back(s.substr(pos, hit - pos));
+        pos = hit + delim.size();
+    }
+    out.push_back(s.substr(pos));
+    return out;
+}
+
+// Parse the shuttle page into a flat list of departures. The page nests
+// route -> day tab -> direction column -> list of times; we walk that tree by
+// splitting on the stable class markers rather than matching nested divs.
+static vector<Departure> parseShuttles(const string& html, string& period)
+{
+    smatch m;
+    static const regex periodRe(R"(<h1 class="title">([\s\S]*?)</h1>)", regex::icase);
+    if (regex_search(html, m, periodRe)) period = htmlToText(m[1].str());
+
+    static const regex nameRe(R"(class="drop-menu-item">([\s\S]*?)</div>)", regex::icase);
+    static const regex dayTabRe(
+        R"rx(data-index="(\d+)" class="tab tab-action[^"]*">([\s\S]*?)</span>)rx", regex::icase);
+    static const regex tcOpenRe(R"rx(data-index="(\d+)" class="tab-content)rx", regex::icase);
+    static const regex titleRe(R"(table-title">([\s\S]*?)</span>)", regex::icase);
+    static const regex timeRe(R"([0-2]?[0-9]:[0-5][0-9])");
+
+    vector<Departure> deps;
+    vector<string> routes = splitOn(html, "class=\"dropdown-menu-area\"");
+    for (size_t r = 1; r < routes.size(); ++r) {
+        const string& rb = routes[r];
+        smatch nm;
+        if (!regex_search(rb, nm, nameRe)) continue;
+        string routeName = htmlToText(nm[1].str());
+        if (routeName.empty()) continue;
+
+        unordered_map<string, string> dayByIndex;
+        for (auto it = sregex_iterator(rb.begin(), rb.end(), dayTabRe);
+             it != sregex_iterator(); ++it) {
+            string idx = (*it)[1].str();
+            if (!dayByIndex.count(idx)) dayByIndex[idx] = htmlToText((*it)[2].str());
+        }
+
+        vector<pair<size_t, string>> opens;
+        for (auto it = sregex_iterator(rb.begin(), rb.end(), tcOpenRe);
+             it != sregex_iterator(); ++it) {
+            opens.push_back({(size_t)it->position(), (*it)[1].str()});
+        }
+        for (size_t t = 0; t < opens.size(); ++t) {
+            size_t start = opens[t].first;
+            size_t end = (t + 1 < opens.size()) ? opens[t + 1].first : rb.size();
+            string dayChunk = rb.substr(start, end - start);
+            auto di = dayByIndex.find(opens[t].second);
+            string day = (di != dayByIndex.end()) ? di->second : opens[t].second;
+
+            vector<string> dirs = splitOn(dayChunk, "class=\"date-list-start\"");
+            for (size_t d = 1; d < dirs.size(); ++d) {
+                const string& seg = dirs[d];
+                auto ti = sregex_iterator(seg.begin(), seg.end(), titleRe);
+                auto stop = sregex_iterator();
+                if (ti == stop) continue;
+                string from = htmlToText((*ti)[1].str());
+                ++ti;
+                string to = (ti != stop) ? htmlToText((*ti)[1].str()) : "";
+
+                vector<string> items = splitOn(seg, "class=\"shuttle-list\"");
+                for (size_t k = 1; k < items.size(); ++k) {
+                    smatch tm;
+                    if (regex_search(items[k], tm, timeRe)) {
+                        deps.push_back({routeName, day, from, to, tm.str()});
+                    }
+                }
+            }
+        }
+    }
+    return deps;
+}
+
 struct Json {
     enum Type { Str, Num, Arr, Obj } type = Str;
     string scalar;
@@ -427,6 +519,25 @@ static Json optionsEnvelope(const string& key, const vector<Option>& opts,
     return env;
 }
 
+static Json shuttlesEnvelope(const string& period, const vector<Departure>& deps)
+{
+    Json arr = Json::arr();
+    for (const Departure& d : deps) {
+        Json o = Json::obj();
+        o.set("route", Json::str(d.route))
+         .set("day", Json::str(d.day))
+         .set("from", Json::str(d.from))
+         .set("to", Json::str(d.to))
+         .set("time", Json::str(d.time));
+        arr.push(move(o));
+    }
+    Json env = Json::obj();
+    env.set("period", Json::str(period))
+       .set("count", Json::num((long long)deps.size()))
+       .set("departures", move(arr));
+    return env;
+}
+
 static Json errorJson(const string& message)
 {
     return Json::obj().set("error", Json::str(message));
@@ -455,6 +566,21 @@ static bool isAll(const string& s)
     transform(t.begin(), t.end(), t.begin(),
               [](unsigned char c) { return tolower(c); });
     return t == "all";
+}
+
+static string toLowerAscii(string s)
+{
+    transform(s.begin(), s.end(), s.begin(),
+              [](unsigned char c) { return tolower(c); });
+    return s;
+}
+
+// Case-insensitive substring test; an empty needle matches everything (so an
+// absent filter param is a no-op).
+static bool containsCI(const string& haystack, const string& needle)
+{
+    if (needle.empty()) return true;
+    return toLowerAscii(haystack).find(toLowerAscii(needle)) != string::npos;
 }
 
 class Cache {
@@ -692,11 +818,45 @@ static int runServer(const string& host, int port, bool behindProxy)
         }
     });
 
+    svr.Get("/shuttles", [&](const httplib::Request& req, httplib::Response& res) {
+        bool pretty = wantsPretty(req);
+        if (!allowed(req)) {
+            respond(res, 429, errorJson("rate limit exceeded"), pretty);
+            return;
+        }
+        try {
+            string html;
+            if (auto cached = cache.get("shuttles")) {
+                html = *cached;
+            } else {
+                html = fetchShuttlesHtml();
+                cache.put("shuttles", html, chrono::hours(12));
+            }
+            string period;
+            vector<Departure> deps = parseShuttles(html, period);
+
+            string fRoute = req.get_param_value("route");
+            string fDay = req.get_param_value("day");
+            string fTime = req.get_param_value("time");
+            vector<Departure> filtered;
+            for (const Departure& d : deps) {
+                if (containsCI(d.route, fRoute) && containsCI(d.day, fDay) &&
+                    containsCI(d.time, fTime)) {
+                    filtered.push_back(d);
+                }
+            }
+            respond(res, 200, shuttlesEnvelope(period, filtered), pretty);
+        } catch (const exception& e) {
+            respond(res, 502, errorJson(e.what()), pretty);
+        }
+    });
+
     cout << "suAPI listening on http://" << host << ":" << port
          << (behindProxy ? " (trusting X-Forwarded-For)" : "") << "\n"
          << "  GET /courses?term=202503&subjects=CS,MATH\n"
          << "  GET /terms\n"
          << "  GET /subjects?term=202503\n"
+         << "  GET /shuttles[?route=&day=&time=]\n"
          << "  GET /health\n";
     if (!svr.listen(host.c_str(), port)) {
         cerr << "error: could not bind " << host << ":" << port << "\n";
@@ -755,6 +915,10 @@ int main(int argc, char** argv)
             cout << optionsEnvelope("subjects",
                      parseSelectOptions(fetchSubjectsHtml(enc.get(), args[1]),
                                         "sel_subj"), args[1]).dump(pretty);
+        } else if (!args.empty() && args[0] == "shuttles") {
+            string period;
+            vector<Departure> deps = parseShuttles(fetchShuttlesHtml(), period);
+            cout << shuttlesEnvelope(period, deps).dump(pretty);
         } else if (args.size() >= 2) {
             rc = cliCourses(args[0], args[1], pretty);
         } else {
@@ -765,6 +929,7 @@ int main(int argc, char** argv)
                 "                          (subjects may be 'all' for every code)\n"
                 "  terms                   list available terms\n"
                 "  subjects <term>         list subjects for a term\n"
+                "  shuttles                campus shuttle schedule\n"
                 "  flags: --compact | --pretty\n"
                 "  serve flags: --host <addr> (default 127.0.0.1; use 0.0.0.0\n"
                 "               for public), --behind-proxy (trust "

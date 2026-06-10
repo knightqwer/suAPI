@@ -446,6 +446,17 @@ static bool validSubject(const string& code)
     return regex_match(code, re);
 }
 
+static bool isAll(const string& s)
+{
+    size_t b = s.find_first_not_of(" \t\r\n");
+    size_t e = s.find_last_not_of(" \t\r\n");
+    if (b == string::npos) return false;
+    string t = s.substr(b, e - b + 1);
+    transform(t.begin(), t.end(), t.begin(),
+              [](unsigned char c) { return tolower(c); });
+    return t == "all";
+}
+
 class Cache {
 public:
     optional<string> get(const string& key)
@@ -538,11 +549,11 @@ static int runServer(const string& host, int port, bool behindProxy)
             return;
         }
         string term = req.get_param_value("term");
-        vector<string> subjects = parseSubjectList(req.get_param_value("subjects"));
-        if (term.empty() || subjects.empty()) {
+        string subjectsParam = req.get_param_value("subjects");
+        if (term.empty() || subjectsParam.empty()) {
             respond(res, 400,
                     errorJson("required query params: term, subjects "
-                              "(e.g. ?term=202503&subjects=CS,MATH)"),
+                              "(e.g. ?term=202503&subjects=CS,MATH or all)"),
                     pretty);
             return;
         }
@@ -551,25 +562,56 @@ static int runServer(const string& host, int port, bool behindProxy)
                     pretty);
             return;
         }
-        if (subjects.size() > kMaxSubjects) {
-            respond(res, 400,
-                    errorJson("too many subjects (max " +
-                              to_string(kMaxSubjects) + ")"),
-                    pretty);
-            return;
-        }
-        for (const string& s : subjects) {
-            if (!validSubject(s)) {
+
+        bool wantAll = isAll(subjectsParam);
+        vector<string> subjects;
+        if (!wantAll) {
+            subjects = parseSubjectList(subjectsParam);
+            if (subjects.size() > kMaxSubjects) {
                 respond(res, 400,
-                        errorJson("invalid subject code: " + s), pretty);
+                        errorJson("too many subjects (max " +
+                                  to_string(kMaxSubjects) + "); use 'all' "
+                                  "for the full catalog"),
+                        pretty);
                 return;
             }
+            for (const string& s : subjects) {
+                if (!validSubject(s)) {
+                    respond(res, 400,
+                            errorJson("invalid subject code: " + s), pretty);
+                    return;
+                }
+            }
         }
+
         try {
-            vector<string> sorted = subjects;
-            sort(sorted.begin(), sorted.end());
-            string key = "sched:" + term + ":";
-            for (const string& s : sorted) key += s + ",";
+            if (wantAll) {
+                string subjKey = "subjects:" + term;
+                string subjHtml;
+                if (auto cached = cache.get(subjKey)) {
+                    subjHtml = *cached;
+                } else {
+                    Curl enc;
+                    subjHtml = fetchSubjectsHtml(enc.get(), term);
+                    cache.put(subjKey, subjHtml, chrono::hours(12));
+                }
+                for (const Option& o : parseSelectOptions(subjHtml, "sel_subj")) {
+                    subjects.push_back(o.value);
+                }
+            }
+
+            string key;
+            chrono::seconds ttl;
+            if (wantAll) {
+                key = "sched:" + term + ":__all__";
+                ttl = chrono::hours(6);
+            } else {
+                vector<string> sorted = subjects;
+                sort(sorted.begin(), sorted.end());
+                key = "sched:" + term + ":";
+                for (const string& s : sorted) key += s + ",";
+                ttl = chrono::hours(1);
+            }
 
             string html;
             if (auto cached = cache.get(key)) {
@@ -577,7 +619,7 @@ static int runServer(const string& host, int port, bool behindProxy)
             } else {
                 Curl enc;
                 html = fetchScheduleHtml(enc.get(), term, subjects);
-                cache.put(key, html, chrono::hours(1));
+                cache.put(key, html, ttl);
             }
             respond(res, 200,
                     coursesEnvelope(term, subjects, parseCourses(html)), pretty);
@@ -656,17 +698,6 @@ static int runServer(const string& host, int port, bool behindProxy)
         return 1;
     }
     return 0;
-}
-
-static bool isAll(const string& s)
-{
-    size_t b = s.find_first_not_of(" \t\r\n");
-    size_t e = s.find_last_not_of(" \t\r\n");
-    if (b == string::npos) return false;
-    string t = s.substr(b, e - b + 1);
-    transform(t.begin(), t.end(), t.begin(),
-              [](unsigned char c) { return tolower(c); });
-    return t == "all";
 }
 
 static int cliCourses(const string& term, const string& subjectsCsv, bool pretty)

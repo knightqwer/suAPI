@@ -387,13 +387,14 @@ static vector<Departure> parseShuttles(const string& html, string& period)
 }
 
 struct Json {
-    enum Type { Str, Num, Arr, Obj } type = Str;
+    enum Type { Str, Num, Bool, Arr, Obj } type = Str;
     string scalar;
     vector<Json> items;
     vector<pair<string, Json>> members;
 
     static Json str(const string& s) { Json j; j.type = Str; j.scalar = s; return j; }
     static Json num(long long n)     { Json j; j.type = Num; j.scalar = to_string(n); return j; }
+    static Json boolean(bool b)      { Json j; j.type = Bool; j.scalar = b ? "true" : "false"; return j; }
     static Json arr()                { Json j; j.type = Arr; return j; }
     static Json obj()                { Json j; j.type = Obj; return j; }
 
@@ -429,7 +430,8 @@ struct Json {
         auto ind = [&](int d) { return pretty ? string(d * 2, ' ') : string(); };
         const string colon = pretty ? ": " : ":";
         switch (type) {
-            case Num: os << scalar; break;
+            case Num:
+            case Bool: os << scalar; break;
             case Str: os << escape(scalar); break;
             case Arr:
                 if (items.empty()) { os << "[]"; break; }
@@ -536,6 +538,70 @@ static Json shuttlesEnvelope(const string& period, const vector<Departure>& deps
        .set("count", Json::num((long long)deps.size()))
        .set("departures", move(arr));
     return env;
+}
+
+static Json apiHelp()
+{
+    auto param = [](const string& name, bool required, const string& desc) {
+        return Json::obj()
+            .set("name", Json::str(name))
+            .set("required", Json::boolean(required))
+            .set("description", Json::str(desc));
+    };
+    auto endpoint = [](const string& path, const string& desc,
+                       vector<Json> params, vector<string> examples) {
+        Json ep = Json::obj();
+        ep.set("path", Json::str(path))
+          .set("method", Json::str("GET"))
+          .set("description", Json::str(desc));
+        Json pa = Json::arr();
+        for (Json& x : params) pa.push(move(x));
+        ep.set("params", move(pa));
+        Json ex = Json::arr();
+        for (const string& e : examples) ex.push(Json::str(e));
+        ep.set("examples", move(ex));
+        return ep;
+    };
+
+    Json endpoints = Json::arr();
+    endpoints.push(endpoint("/courses",
+        "Course sections for a term. Provide either 'subjects' or 'codes'.",
+        { param("term", true, "6-digit term, e.g. 202503"),
+          param("subjects", false, "comma-separated subject codes (CS,MATH), "
+                                    "or 'all' for every subject"),
+          param("codes", false, "comma-separated course codes (CS204,MATH101); "
+                                 "exact match; mutually exclusive with subjects"),
+          param("pretty", false, "if present, indent the JSON") },
+        { "/courses?term=202503&subjects=CS,MATH",
+          "/courses?term=202503&subjects=all",
+          "/courses?term=202503&codes=CS204,MATH101" }));
+    endpoints.push(endpoint("/terms",
+        "List the terms SUIS offers.",
+        { param("pretty", false, "if present, indent the JSON") },
+        { "/terms" }));
+    endpoints.push(endpoint("/subjects",
+        "List subject codes offered in a term.",
+        { param("term", true, "6-digit term, e.g. 202503"),
+          param("pretty", false, "if present, indent the JSON") },
+        { "/subjects?term=202503" }));
+    endpoints.push(endpoint("/shuttles",
+        "Campus shuttle departures, optionally filtered.",
+        { param("route", false, "filter by route, substring (e.g. levent)"),
+          param("day", false, "filter by day (Hafta Ici, Cumartesi, Pazar), substring"),
+          param("time", false, "filter by departure time, substring (e.g. 07)"),
+          param("pretty", false, "if present, indent the JSON") },
+        { "/shuttles", "/shuttles?route=levent&day=cumartesi" }));
+    endpoints.push(endpoint("/health", "Liveness check.", {}, { "/health" }));
+    endpoints.push(endpoint("/help", "This documentation.", {}, { "/help" }));
+
+    Json doc = Json::obj();
+    doc.set("name", Json::str("suAPI"))
+       .set("description", Json::str(
+            "Unofficial Sabanci University course-schedule and shuttle API. "
+            "All responses are JSON; add ?pretty for indentation. Unknown query "
+            "params are rejected with 400 on data endpoints."))
+       .set("endpoints", move(endpoints));
+    return doc;
 }
 
 static Json errorJson(const string& message)
@@ -706,6 +772,12 @@ static int runServer(const string& host, int port, bool behindProxy)
     svr.Get("/health", [](const httplib::Request&, httplib::Response& res) {
         respond(res, 200, Json::obj().set("status", Json::str("ok")), false);
     });
+
+    auto helpHandler = [](const httplib::Request& req, httplib::Response& res) {
+        respond(res, 200, apiHelp(), req.has_param("pretty"));
+    };
+    svr.Get("/help", helpHandler);
+    svr.Get("/", helpHandler);
 
     svr.Get("/courses", [&](const httplib::Request& req, httplib::Response& res) {
         bool pretty = wantsPretty(req);
@@ -964,7 +1036,8 @@ static int runServer(const string& host, int port, bool behindProxy)
          << "  GET /terms\n"
          << "  GET /subjects?term=202503\n"
          << "  GET /shuttles[?route=&day=&time=]\n"
-         << "  GET /health\n";
+         << "  GET /health\n"
+         << "  GET /help\n";
     if (!svr.listen(host.c_str(), port)) {
         cerr << "error: could not bind " << host << ":" << port << "\n";
         return 1;
@@ -1061,6 +1134,8 @@ int main(int argc, char** argv)
             string period;
             vector<Departure> deps = parseShuttles(fetchShuttlesHtml(), period);
             cout << shuttlesEnvelope(period, deps).dump(pretty);
+        } else if (!args.empty() && args[0] == "help") {
+            cout << apiHelp().dump(pretty);
         } else if (args.size() >= 2) {
             rc = cliCourses(args[0], args[1], pretty);
         } else {

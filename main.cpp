@@ -567,6 +567,11 @@ static int runServer(const string& host, int port, bool behindProxy)
         vector<string> subjects;
         if (!wantAll) {
             subjects = parseSubjectList(subjectsParam);
+            if (subjects.empty()) {
+                respond(res, 400,
+                        errorJson("no valid subject codes given"), pretty);
+                return;
+            }
             if (subjects.size() > kMaxSubjects) {
                 respond(res, 400,
                         errorJson("too many subjects (max " +

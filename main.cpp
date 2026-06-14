@@ -1537,6 +1537,8 @@ int main(int argc, char** argv)
                 "  terms                   list available terms\n"
                 "  subjects <term>         list subjects for a term\n"
                 "  shuttles                campus shuttle schedule\n"
+                "  cafeteria               akkol cafeteria info(Work in progress)\n"
+                "  roomstat                classroom availability info(Work in progress)\n"
                 "  flags: --compact | --pretty\n"
                 "  serve flags: --host <addr> (default 127.0.0.1; use 0.0.0.0\n"
                 "               for public), --behind-proxy (trust "

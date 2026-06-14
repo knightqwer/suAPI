@@ -597,9 +597,8 @@ static Json apiHelp()
     Json doc = Json::obj();
     doc.set("name", Json::str("suAPI"))
        .set("description", Json::str(
-            "Unofficial Sabanci University course-schedule and shuttle API. "
-            "All responses are JSON; add ?pretty for indentation. Unknown query "
-            "params are rejected with 400 on data endpoints."))
+            "Unofficial Sabanci University course schedule and shuttle API. " 
+           ))
        .set("endpoints", move(endpoints));
     return doc;
 }

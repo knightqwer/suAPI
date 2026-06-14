@@ -338,7 +338,7 @@ static int dayIndex(char c)
 static bool parseTimeRange(const string& t, int& start, int& end)
 {
     static const regex re(
-        R"(^\s*(\d{1,2}):(\d{2})\s*([apAP])[mM]\s*-\s*(\d{1,2}):(\d{2})\s*([apAP])[mM]\s*$)");
+        R"(^\s*(1[0-2]|0?[1-9]):([0-5][0-9])\s*([apAP])[mM]\s*-\s*(1[0-2]|0?[1-9]):([0-5][0-9])\s*([apAP])[mM]\s*$)");
     smatch m;
     if (!regex_match(t, m, re)) return false;
     auto to24 = [](int h, int mi, char ap) {
@@ -424,9 +424,7 @@ static void enumerateSchedules(ScheduleSearch& s, size_t depth)
     }
 }
 
-// Parse the shuttle page into a flat list of departures. The page nests
-// route -> day tab -> direction column -> list of times; we walk that tree by
-// splitting on the stable class markers rather than matching nested divs.
+
 static vector<Departure> parseShuttles(const string& html, string& period)
 {
     smatch m;
@@ -611,6 +609,34 @@ static Json coursesEnvelope(const string& term, const vector<string>& subjects,
     return env;
 }
 
+static Json autoscheduleEnvelope(const string& term,
+                                 const vector<string>& codes,
+                                 const vector<string>& missing,
+                                 const vector<vector<const Course*>>& schedules,
+                                 bool truncated)
+{
+    Json codeArr = Json::arr();
+    for (const string& c : codes) codeArr.push(Json::str(c));
+    Json missArr = Json::arr();
+    for (const string& c : missing) missArr.push(Json::str(c));
+
+    Json schedArr = Json::arr();
+    for (const vector<const Course*>& sched : schedules) {
+        Json sections = Json::arr();
+        for (const Course* c : sched) sections.push(courseToJson(*c));
+        schedArr.push(Json::obj().set("sections", move(sections)));
+    }
+
+    Json env = Json::obj();
+    env.set("term", Json::str(term))
+       .set("codes", move(codeArr))
+       .set("missing", move(missArr))
+       .set("count", Json::num((long long)schedules.size()))
+       .set("truncated", Json::boolean(truncated))
+       .set("schedules", move(schedArr));
+    return env;
+}
+
 static Json optionsEnvelope(const string& key, const vector<Option>& opts,
                             const optional<string>& term = nullopt)
 {
@@ -680,6 +706,14 @@ static Json apiHelp()
         { "/courses?term=202503&subjects=CS,MATH",
           "/courses?term=202503&subjects=all",
           "/courses?term=202503&codes=CS204,MATH101" }));
+    endpoints.push(endpoint("/autoschedule",
+        "All conflict-free schedules combining one section of each given course.",
+        { param("term", true, "6-digit term, e.g. 202503"),
+          param("codes", true, "comma-separated course codes (CS204,CS201); "
+                               "one section of each is picked per schedule"),
+          param("pretty", false, "if present, indent the JSON") },
+        { "/autoschedule?term=202501&codes=CS204,CS201",
+          "/autoschedule?term=202501&codes=MATH101,HIST191,CS201" }));
     endpoints.push(endpoint("/terms",
         "List the terms SUIS offers.",
         { param("pretty", false, "if present, indent the JSON") },
@@ -714,6 +748,7 @@ static Json errorJson(const string& message)
 }
 
 static const size_t kMaxSubjects = 20;
+static const size_t kMaxAutoCodes = 10;
 
 static bool validTerm(const string& term)
 {
@@ -729,9 +764,6 @@ static bool validSubject(const string& code)
 
 struct CourseCode { string subject, number; };
 
-// "cs204" -> {"CS","204"}: leading letters are the subject, the rest the course
-// number. Returns false if it isn't letters-then-something or the subject is
-// not a valid code.
 static bool parseCode(const string& raw, CourseCode& out)
 {
     size_t b = raw.find_first_not_of(" \t\r\n");
@@ -769,8 +801,6 @@ static string toLowerAscii(string s)
     return s;
 }
 
-// Case-insensitive substring test; an empty needle matches everything (so an
-// absent filter param is a no-op).
 static bool containsCI(const string& haystack, const string& needle)
 {
     if (needle.empty()) return true;
@@ -845,8 +875,6 @@ static string clientIp(const httplib::Request& req, bool behindProxy)
     return req.remote_addr;
 }
 
-// Returns the first query param not in the allowed list, or "" if all are
-// recognized. Lets each endpoint reject typos / misplaced params with a 400.
 static string unknownParam(const httplib::Request& req,
                            initializer_list<const char*> allowed)
 {
@@ -917,8 +945,8 @@ static int runServer(const string& host, int port, bool behindProxy)
         }
 
         bool wantAll = false;
-        vector<string> subjects;      // subjects to fetch
-        vector<CourseCode> codes;     // exact (subject, number) filter; empty = none
+        vector<string> subjects;
+        vector<CourseCode> codes;
 
         if (!codesParam.empty()) {
             for (const string& tok : parseSubjectList(codesParam)) {
@@ -1023,6 +1051,112 @@ static int runServer(const string& host, int port, bool behindProxy)
                 courses = move(filtered);
             }
             respond(res, 200, coursesEnvelope(term, subjects, courses), pretty);
+        } catch (const exception& e) {
+            respond(res, 502, errorJson(e.what()), pretty);
+        }
+    });
+
+    svr.Get("/autoschedule", [&](const httplib::Request& req, httplib::Response& res) {
+        bool pretty = wantsPretty(req);
+        if (!allowed(req)) {
+            respond(res, 429, errorJson("rate limit exceeded"), pretty);
+            return;
+        }
+        if (string bad = unknownParam(req, {"term", "codes", "pretty"});
+            !bad.empty()) {
+            respond(res, 400, errorJson("unknown query param: " + bad), pretty);
+            return;
+        }
+        string term = req.get_param_value("term");
+        string codesParam = req.get_param_value("codes");
+        if (term.empty() || codesParam.empty()) {
+            respond(res, 400,
+                    errorJson("required: term and codes "
+                              "(e.g. ?term=202503&codes=CS204,CS201)"),
+                    pretty);
+            return;
+        }
+        if (!validTerm(term)) {
+            respond(res, 400, errorJson("term must be 6 digits, e.g. 202503"),
+                    pretty);
+            return;
+        }
+
+        vector<CourseCode> codes;
+        vector<string> codeLabels;
+        for (const string& tok : parseSubjectList(codesParam)) {
+            CourseCode cc;
+            if (!parseCode(tok, cc)) {
+                respond(res, 400,
+                        errorJson("invalid course code: " + tok +
+                                  " (expected like CS204)"), pretty);
+                return;
+            }
+            string label = cc.subject + cc.number;
+            if (find(codeLabels.begin(), codeLabels.end(), label) != codeLabels.end())
+                continue;
+            codes.push_back(cc);
+            codeLabels.push_back(label);
+        }
+        if (codes.empty()) {
+            respond(res, 400, errorJson("no valid course codes given"), pretty);
+            return;
+        }
+        if (codes.size() > kMaxAutoCodes) {
+            respond(res, 400,
+                    errorJson("too many course codes (max " +
+                              to_string(kMaxAutoCodes) + ")"), pretty);
+            return;
+        }
+
+        vector<string> subjects;
+        for (const CourseCode& c : codes) {
+            if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
+                subjects.push_back(c.subject);
+        }
+        if (subjects.size() > kMaxSubjects) {
+            respond(res, 400,
+                    errorJson("too many distinct subjects in codes (max " +
+                              to_string(kMaxSubjects) + ")"), pretty);
+            return;
+        }
+
+        try {
+            vector<string> sorted = subjects;
+            sort(sorted.begin(), sorted.end());
+            string key = "sched:" + term + ":";
+            for (const string& s : sorted) key += s + ",";
+
+            string html;
+            if (auto cached = cache.get(key)) {
+                html = *cached;
+            } else {
+                Curl enc;
+                html = fetchScheduleHtml(enc.get(), term, subjects);
+                cache.put(key, html, chrono::hours(1));
+            }
+
+            vector<Course> courses = parseCourses(html);
+
+            vector<vector<SectionCand>> groups(codes.size());
+            vector<string> missing;
+            for (size_t i = 0; i < codes.size(); ++i) {
+                for (const Course& c : courses) {
+                    if (c.subject == codes[i].subject &&
+                        c.course == codes[i].number) {
+                        groups[i].push_back({&c, sectionSlots(c)});
+                    }
+                }
+                if (groups[i].empty()) missing.push_back(codeLabels[i]);
+            }
+
+            ScheduleSearch search{groups};
+            if (missing.empty()) enumerateSchedules(search, 0);
+
+            respond(res, 200,
+                    autoscheduleEnvelope(term, codeLabels, missing,
+                                         search.out, search.truncated),
+                    pretty);
         } catch (const exception& e) {
             respond(res, 502, errorJson(e.what()), pretty);
         }
@@ -1137,6 +1271,7 @@ static int runServer(const string& host, int port, bool behindProxy)
          << (behindProxy ? " (trusting X-Forwarded-For)" : "") << "\n"
          << "  GET /courses?term=202503&subjects=CS,MATH (or &subjects=all,"
             " or &codes=CS204,MATH101)\n"
+         << "  GET /autoschedule?term=202503&codes=CS204,CS201\n"
          << "  GET /terms\n"
          << "  GET /subjects?term=202503\n"
          << "  GET /shuttles[?route=&day=&time=]\n"
@@ -1162,9 +1297,6 @@ static int cliCourses(const string& term, const string& arg, bool pretty)
         }
     } else {
         vector<string> toks = parseSubjectList(arg);
-        // A token containing a digit (CS204) is a course code; plain letters
-        // (CS) are a subject. Treat the whole list as codes only if every
-        // token carries a number.
         bool asCodes = !toks.empty();
         for (const string& t : toks) {
             if (t.find_first_of("0123456789") == string::npos) { asCodes = false; break; }

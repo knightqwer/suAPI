@@ -381,6 +381,21 @@ static bool sectionsConflict(const vector<TimeSlot>& a, const vector<TimeSlot>& 
     return false;
 }
 
+static string slotSignature(vector<TimeSlot> slots)
+{
+    sort(slots.begin(), slots.end(), [](const TimeSlot& a, const TimeSlot& b) {
+        if (a.day != b.day) return a.day < b.day;
+        if (a.start != b.start) return a.start < b.start;
+        return a.end < b.end;
+    });
+    string sig;
+    for (const TimeSlot& s : slots) {
+        sig += to_string(s.day) + ':' + to_string(s.start) + '-' +
+               to_string(s.end) + '|';
+    }
+    return sig;
+}
+
 struct SectionCand {
     const Course* course;
     vector<TimeSlot> slots;
@@ -423,7 +438,6 @@ static void enumerateSchedules(ScheduleSearch& s, size_t depth)
         if (s.truncated) return;
     }
 }
-
 
 static vector<Departure> parseShuttles(const string& html, string& period)
 {
@@ -707,10 +721,13 @@ static Json apiHelp()
           "/courses?term=202503&subjects=all",
           "/courses?term=202503&codes=CS204,MATH101" }));
     endpoints.push(endpoint("/autoschedule",
-        "All conflict-free schedules combining one section of each given course.",
+        "Distinct conflict-free schedules combining one section of each given "
+        "course; sections sharing the same meeting time are collapsed to one.",
         { param("term", true, "6-digit term, e.g. 202503"),
-          param("codes", true, "comma-separated course codes (CS204,CS201); "
-                               "one section of each is picked per schedule"),
+          param("codes", true, "course codes (CS204,CS201)"
+                               "one section of each is picked per schedule: if a "
+                               "course has a recitation/lab/discussion you must "
+                               "also include that code (like CS204,CS204L)"),
           param("pretty", false, "if present, indent the JSON") },
         { "/autoschedule?term=202501&codes=CS204,CS201",
           "/autoschedule?term=202501&codes=MATH101,HIST191,CS201" }));
@@ -807,6 +824,124 @@ static bool containsCI(const string& haystack, const string& needle)
     return toLowerAscii(haystack).find(toLowerAscii(needle)) != string::npos;
 }
 
+static string courseDigitPrefix(const string& number)
+{
+    size_t i = number.size();
+    while (i > 0 && isalpha((unsigned char)number[i - 1])) --i;
+    return number.substr(0, i);
+}
+
+static bool endsWithAlpha(const string& number)
+{
+    return !number.empty() && isalpha((unsigned char)number.back());
+}
+
+static vector<string> missingCoreqCodes(const vector<Course>& courses,
+                                        const vector<CourseCode>& codes,
+                                        const vector<string>& codeLabels)
+{
+    unordered_map<string, vector<string>> variantsByBase;
+    for (const Course& c : courses) {
+        if (!endsWithAlpha(c.course)) continue;
+        string base = courseDigitPrefix(c.course);
+        if (base.empty()) continue;
+        string key = c.subject + " " + base;
+        string label = c.subject + c.course;
+        vector<string>& v = variantsByBase[key];
+        if (find(v.begin(), v.end(), label) == v.end()) v.push_back(label);
+    }
+
+    vector<string> required;
+    for (const CourseCode& cc : codes) {
+        if (endsWithAlpha(cc.number)) continue;
+        auto it = variantsByBase.find(cc.subject + " " + cc.number);
+        if (it == variantsByBase.end()) continue;
+        for (const string& label : it->second) {
+            if (find(codeLabels.begin(), codeLabels.end(), label) == codeLabels.end() &&
+                find(required.begin(), required.end(), label) == required.end()) {
+                required.push_back(label);
+            }
+        }
+    }
+    return required;
+}
+
+static string parseCodeList(const string& codesParam,
+                            vector<CourseCode>& codes,
+                            vector<string>& codeLabels)
+{
+    for (const string& tok : parseSubjectList(codesParam)) {
+        CourseCode cc;
+        if (!parseCode(tok, cc))
+            return "invalid course code: " + tok + " (expected like CS204)";
+        string label = cc.subject + cc.number;
+        if (find(codeLabels.begin(), codeLabels.end(), label) != codeLabels.end())
+            continue;
+        codes.push_back(cc);
+        codeLabels.push_back(label);
+    }
+    if (codes.empty()) return "no valid course codes given";
+    return "";
+}
+
+static vector<string> subjectsOf(const vector<CourseCode>& codes)
+{
+    vector<string> subjects;
+    for (const CourseCode& c : codes) {
+        if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
+            subjects.push_back(c.subject);
+    }
+    return subjects;
+}
+
+struct AutoscheduleResult {
+    vector<string> missingCoreqs;
+    vector<string> missing;
+    vector<vector<const Course*>> schedules;
+    bool truncated = false;
+};
+
+static AutoscheduleResult buildAutoschedules(const vector<Course>& courses,
+                                             const vector<CourseCode>& codes,
+                                             const vector<string>& codeLabels)
+{
+    AutoscheduleResult result;
+    result.missingCoreqs = missingCoreqCodes(courses, codes, codeLabels);
+    if (!result.missingCoreqs.empty()) return result;
+
+    vector<vector<SectionCand>> groups(codes.size());
+    for (size_t i = 0; i < codes.size(); ++i) {
+        vector<string> seen;
+        for (const Course& c : courses) {
+            if (c.subject != codes[i].subject || c.course != codes[i].number)
+                continue;
+            vector<TimeSlot> slots = sectionSlots(c);
+            string sig = slotSignature(slots);
+            if (find(seen.begin(), seen.end(), sig) != seen.end()) continue;
+            seen.push_back(sig);
+            groups[i].push_back({&c, move(slots)});
+        }
+        if (groups[i].empty()) result.missing.push_back(codeLabels[i]);
+    }
+    if (!result.missing.empty()) return result;
+
+    ScheduleSearch search{groups};
+    enumerateSchedules(search, 0);
+    result.schedules = move(search.out);
+    result.truncated = search.truncated;
+    return result;
+}
+
+static string joinCodes(const vector<string>& codes)
+{
+    string out;
+    for (size_t i = 0; i < codes.size(); ++i) {
+        if (i) out += ", ";
+        out += codes[i];
+    }
+    return out;
+}
+
 class Cache {
 public:
     optional<string> get(const string& key)
@@ -893,6 +1028,7 @@ static int runServer(const string& host, int port, bool behindProxy)
     httplib::Server svr;
     Cache cache;
     RateLimiter limiter(60, chrono::seconds(60));
+    RateLimiter autoLimiter(5, chrono::seconds(60));
 
     auto wantsPretty = [](const httplib::Request& req) {
         return req.has_param("pretty");
@@ -1062,6 +1198,11 @@ static int runServer(const string& host, int port, bool behindProxy)
             respond(res, 429, errorJson("rate limit exceeded"), pretty);
             return;
         }
+        if (!autoLimiter.allow(clientIp(req, behindProxy))) {
+            respond(res, 429,
+                    errorJson("rate limit exceeded for /autoschedule"), pretty);
+            return;
+        }
         if (string bad = unknownParam(req, {"term", "codes", "pretty"});
             !bad.empty()) {
             respond(res, 400, errorJson("unknown query param: " + bad), pretty);
@@ -1084,22 +1225,9 @@ static int runServer(const string& host, int port, bool behindProxy)
 
         vector<CourseCode> codes;
         vector<string> codeLabels;
-        for (const string& tok : parseSubjectList(codesParam)) {
-            CourseCode cc;
-            if (!parseCode(tok, cc)) {
-                respond(res, 400,
-                        errorJson("invalid course code: " + tok +
-                                  " (expected like CS204)"), pretty);
-                return;
-            }
-            string label = cc.subject + cc.number;
-            if (find(codeLabels.begin(), codeLabels.end(), label) != codeLabels.end())
-                continue;
-            codes.push_back(cc);
-            codeLabels.push_back(label);
-        }
-        if (codes.empty()) {
-            respond(res, 400, errorJson("no valid course codes given"), pretty);
+        if (string err = parseCodeList(codesParam, codes, codeLabels);
+            !err.empty()) {
+            respond(res, 400, errorJson(err), pretty);
             return;
         }
         if (codes.size() > kMaxAutoCodes) {
@@ -1108,12 +1236,7 @@ static int runServer(const string& host, int port, bool behindProxy)
                               to_string(kMaxAutoCodes) + ")"), pretty);
             return;
         }
-
-        vector<string> subjects;
-        for (const CourseCode& c : codes) {
-            if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
-                subjects.push_back(c.subject);
-        }
+        vector<string> subjects = subjectsOf(codes);
         if (subjects.size() > kMaxSubjects) {
             respond(res, 400,
                     errorJson("too many distinct subjects in codes (max " +
@@ -1137,25 +1260,18 @@ static int runServer(const string& host, int port, bool behindProxy)
             }
 
             vector<Course> courses = parseCourses(html);
-
-            vector<vector<SectionCand>> groups(codes.size());
-            vector<string> missing;
-            for (size_t i = 0; i < codes.size(); ++i) {
-                for (const Course& c : courses) {
-                    if (c.subject == codes[i].subject &&
-                        c.course == codes[i].number) {
-                        groups[i].push_back({&c, sectionSlots(c)});
-                    }
-                }
-                if (groups[i].empty()) missing.push_back(codeLabels[i]);
+            AutoscheduleResult sched =
+                buildAutoschedules(courses, codes, codeLabels);
+            if (!sched.missingCoreqs.empty()) {
+                respond(res, 400,
+                        errorJson("missing required recitation/lab/discussion "
+                                  "sections: " + joinCodes(sched.missingCoreqs) +
+                                  " (add them to codes)"), pretty);
+                return;
             }
-
-            ScheduleSearch search{groups};
-            if (missing.empty()) enumerateSchedules(search, 0);
-
             respond(res, 200,
-                    autoscheduleEnvelope(term, codeLabels, missing,
-                                         search.out, search.truncated),
+                    autoscheduleEnvelope(term, codeLabels, sched.missing,
+                                         sched.schedules, sched.truncated),
                     pretty);
         } catch (const exception& e) {
             respond(res, 502, errorJson(e.what()), pretty);
@@ -1341,50 +1457,24 @@ static int cliAutoschedule(const string& term, const string& codesArg, bool pret
 {
     vector<CourseCode> codes;
     vector<string> codeLabels;
-    for (const string& tok : parseSubjectList(codesArg)) {
-        CourseCode cc;
-        if (!parseCode(tok, cc)) {
-            cout << errorJson("invalid course code: " + tok +
-                              " (expected like CS204)").dump(pretty);
-            return 2;
-        }
-        string label = cc.subject + cc.number;
-        if (find(codeLabels.begin(), codeLabels.end(), label) != codeLabels.end())
-            continue;
-        codes.push_back(cc);
-        codeLabels.push_back(label);
-    }
-    if (codes.empty()) {
-        cout << errorJson("no valid course codes given").dump(pretty);
+    if (string err = parseCodeList(codesArg, codes, codeLabels); !err.empty()) {
+        cout << errorJson(err).dump(pretty);
         return 2;
     }
 
-    vector<string> subjects;
-    for (const CourseCode& c : codes) {
-        if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
-            subjects.push_back(c.subject);
-    }
-
     Curl enc;
-    string html = fetchScheduleHtml(enc.get(), term, subjects);
+    string html = fetchScheduleHtml(enc.get(), term, subjectsOf(codes));
     vector<Course> courses = parseCourses(html);
-
-    vector<vector<SectionCand>> groups(codes.size());
-    vector<string> missing;
-    for (size_t i = 0; i < codes.size(); ++i) {
-        for (const Course& c : courses) {
-            if (c.subject == codes[i].subject && c.course == codes[i].number) {
-                groups[i].push_back({&c, sectionSlots(c)});
-            }
-        }
-        if (groups[i].empty()) missing.push_back(codeLabels[i]);
+    AutoscheduleResult sched = buildAutoschedules(courses, codes, codeLabels);
+    if (!sched.missingCoreqs.empty()) {
+        cout << errorJson("missing required recitation/lab/discussion sections: " +
+                          joinCodes(sched.missingCoreqs) +
+                          " (add them to codes)").dump(pretty);
+        return 2;
     }
 
-    ScheduleSearch search{groups};
-    if (missing.empty()) enumerateSchedules(search, 0);
-
-    cout << autoscheduleEnvelope(term, codeLabels, missing,
-                                 search.out, search.truncated).dump(pretty);
+    cout << autoscheduleEnvelope(term, codeLabels, sched.missing,
+                                 sched.schedules, sched.truncated).dump(pretty);
     return 0;
 }
 

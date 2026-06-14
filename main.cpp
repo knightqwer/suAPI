@@ -1337,6 +1337,57 @@ static int cliCourses(const string& term, const string& arg, bool pretty)
     return 0;
 }
 
+static int cliAutoschedule(const string& term, const string& codesArg, bool pretty)
+{
+    vector<CourseCode> codes;
+    vector<string> codeLabels;
+    for (const string& tok : parseSubjectList(codesArg)) {
+        CourseCode cc;
+        if (!parseCode(tok, cc)) {
+            cout << errorJson("invalid course code: " + tok +
+                              " (expected like CS204)").dump(pretty);
+            return 2;
+        }
+        string label = cc.subject + cc.number;
+        if (find(codeLabels.begin(), codeLabels.end(), label) != codeLabels.end())
+            continue;
+        codes.push_back(cc);
+        codeLabels.push_back(label);
+    }
+    if (codes.empty()) {
+        cout << errorJson("no valid course codes given").dump(pretty);
+        return 2;
+    }
+
+    vector<string> subjects;
+    for (const CourseCode& c : codes) {
+        if (find(subjects.begin(), subjects.end(), c.subject) == subjects.end())
+            subjects.push_back(c.subject);
+    }
+
+    Curl enc;
+    string html = fetchScheduleHtml(enc.get(), term, subjects);
+    vector<Course> courses = parseCourses(html);
+
+    vector<vector<SectionCand>> groups(codes.size());
+    vector<string> missing;
+    for (size_t i = 0; i < codes.size(); ++i) {
+        for (const Course& c : courses) {
+            if (c.subject == codes[i].subject && c.course == codes[i].number) {
+                groups[i].push_back({&c, sectionSlots(c)});
+            }
+        }
+        if (groups[i].empty()) missing.push_back(codeLabels[i]);
+    }
+
+    ScheduleSearch search{groups};
+    if (missing.empty()) enumerateSchedules(search, 0);
+
+    cout << autoscheduleEnvelope(term, codeLabels, missing,
+                                 search.out, search.truncated).dump(pretty);
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     bool pretty = true;
@@ -1372,6 +1423,14 @@ int main(int argc, char** argv)
             cout << shuttlesEnvelope(period, deps).dump(pretty);
         } else if (!args.empty() && args[0] == "help") {
             cout << apiHelp().dump(pretty);
+        } else if (!args.empty() && args[0] == "autoschedule") {
+            if (args.size() < 3) {
+                cout << errorJson("usage: autoschedule <term> <codes>, "
+                                  "e.g. autoschedule 202503 CS204,CS201").dump(pretty);
+                rc = 2;
+            } else {
+                rc = cliAutoschedule(args[1], args[2], pretty);
+            }
         } else if (args.size() >= 2) {
             rc = cliCourses(args[0], args[1], pretty);
         } else {
@@ -1381,6 +1440,10 @@ int main(int argc, char** argv)
                 "  <term> <subjects>       course sections, e.g. 202503 CS,MATH\n"
                 "                          ('all' for every subject, or specific\n"
                 "                          courses like 202503 CS204,MATH101)\n"
+                "  autoschedule <term> <codes>\n"
+                "                          conflict-free schedules combining one\n"
+                "                          section of each course, e.g.\n"
+                "                          autoschedule 202503 CS204,CS201\n"
                 "  terms                   list available terms\n"
                 "  subjects <term>         list subjects for a term\n"
                 "  shuttles                campus shuttle schedule\n"

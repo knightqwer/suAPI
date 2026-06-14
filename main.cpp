@@ -1027,7 +1027,7 @@ static int runServer(const string& host, int port, bool behindProxy)
 {
     httplib::Server svr;
     Cache cache;
-    RateLimiter limiter(60, chrono::seconds(60));
+    RateLimiter limiter(20, chrono::seconds(60));
     RateLimiter autoLimiter(5, chrono::seconds(60));
 
     auto wantsPretty = [](const httplib::Request& req) {

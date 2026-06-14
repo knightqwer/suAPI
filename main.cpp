@@ -319,6 +319,111 @@ static vector<string> splitOn(const string& s, const string& delim)
     return out;
 }
 
+struct TimeSlot { int day; int start; int end; };
+
+static int dayIndex(char c)
+{
+    switch (toupper((unsigned char)c)) {
+        case 'M': return 0;
+        case 'T': return 1;
+        case 'W': return 2;
+        case 'R': return 3;
+        case 'F': return 4;
+        case 'S': return 5;
+        case 'U': return 6;
+        default:  return -1;
+    }
+}
+
+static bool parseTimeRange(const string& t, int& start, int& end)
+{
+    static const regex re(
+        R"(^\s*(\d{1,2}):(\d{2})\s*([apAP])[mM]\s*-\s*(\d{1,2}):(\d{2})\s*([apAP])[mM]\s*$)");
+    smatch m;
+    if (!regex_match(t, m, re)) return false;
+    auto to24 = [](int h, int mi, char ap) {
+        ap = (char)tolower((unsigned char)ap);
+        if (ap == 'a') { if (h == 12) h = 0; }
+        else           { if (h != 12) h += 12; }
+        return h * 60 + mi;
+    };
+    start = to24(stoi(m[1].str()), stoi(m[2].str()), m[3].str()[0]);
+    end   = to24(stoi(m[4].str()), stoi(m[5].str()), m[6].str()[0]);
+    return true;
+}
+
+static vector<TimeSlot> sectionSlots(const Course& c)
+{
+    vector<TimeSlot> slots;
+    for (const Meeting& m : c.meetings) {
+        if (m.time.empty() || m.days.empty()) continue;
+        int s, e;
+        if (!parseTimeRange(m.time, s, e)) continue;
+        if (e <= s) continue;
+        for (char ch : m.days) {
+            int d = dayIndex(ch);
+            if (d >= 0) slots.push_back({d, s, e});
+        }
+    }
+    return slots;
+}
+
+static bool slotsOverlap(const TimeSlot& a, const TimeSlot& b)
+{
+    return a.day == b.day && a.start < b.end && b.start < a.end;
+}
+
+static bool sectionsConflict(const vector<TimeSlot>& a, const vector<TimeSlot>& b)
+{
+    for (const TimeSlot& x : a)
+        for (const TimeSlot& y : b)
+            if (slotsOverlap(x, y)) return true;
+    return false;
+}
+
+struct SectionCand {
+    const Course* course;
+    vector<TimeSlot> slots;
+};
+
+static const size_t kMaxSchedules = 1000;
+static const long long kScheduleNodeBudget = 5'000'000;
+
+struct ScheduleSearch {
+    const vector<vector<SectionCand>>& groups;
+    vector<const SectionCand*> cur;
+    vector<vector<const Course*>> out;
+    bool truncated = false;
+    long long budget = kScheduleNodeBudget;
+};
+
+static void enumerateSchedules(ScheduleSearch& s, size_t depth)
+{
+    if (s.truncated) return;
+    if (--s.budget <= 0) { s.truncated = true; return; }
+
+    if (depth == s.groups.size()) {
+        if (s.out.size() >= kMaxSchedules) { s.truncated = true; return; }
+        vector<const Course*> sched;
+        sched.reserve(s.cur.size());
+        for (const SectionCand* sc : s.cur) sched.push_back(sc->course);
+        s.out.push_back(move(sched));
+        return;
+    }
+
+    for (const SectionCand& cand : s.groups[depth]) {
+        bool ok = true;
+        for (const SectionCand* chosen : s.cur) {
+            if (sectionsConflict(chosen->slots, cand.slots)) { ok = false; break; }
+        }
+        if (!ok) continue;
+        s.cur.push_back(&cand);
+        enumerateSchedules(s, depth + 1);
+        s.cur.pop_back();
+        if (s.truncated) return;
+    }
+}
+
 // Parse the shuttle page into a flat list of departures. The page nests
 // route -> day tab -> direction column -> list of times; we walk that tree by
 // splitting on the stable class markers rather than matching nested divs.
